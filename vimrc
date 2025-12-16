@@ -1,5 +1,8 @@
 set runtimepath+=~/.vim_runtime
 
+" Disable vim 9's background color switching
+let g:loaded_colorresp = 1
+
 " For vundle
 let vundle_file=findfile("~/.vim_vundle_rc.vim", ".;")
 if !empty(vundle_file) && filereadable(vundle_file)
@@ -23,7 +26,7 @@ Plug 'rust-lang/rust.vim'
 Plug 'epheien/termdbg'
 " Plug 'airblade/vim-gitgutter'
 Plug 'tpope/vim-fugitive'
-Plug 'davidhalter/jedi-vim'
+" Plug 'davidhalter/jedi-vim'
 " Plug 'neoclide/coc.nvim'
 " Plug 'prabirshrestha/vim-lsp'
 " Plug 'Chiel92/vim-autoformat'
