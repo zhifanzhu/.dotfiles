@@ -1,0 +1,138 @@
+#!/bin/bash
+# iterm2-open-file-link
+#
+# iTerm2 runs this every time you Cmd+click a link. It is set in:
+#   iTerm2 → Settings → Advanced → "Command to run when opening a clicked URL"
+#   (defaults key: com.googlecode.iterm2 UrlHandlerCommand)
+#
+# What it does with the clicked link:
+#   web link (https://…)             → opens it normally, as before
+#   file:// that exists on this Mac  → opens it normally, as before
+#   file:// NOT on this Mac           → fetches it, then shows it in Finder:
+#       /home/linuxuser/…   → from the VPS (vultr)
+#       anything else       → from Isambard, using the clicked tab's route:
+#                             tab runs "ssh seis…" → u6xd-seis, otherwise → u6xd-vultr
+#
+# Where files go:  ~/Downloads/iterm2-opened-files/<file>   (flat; same name = replaced)
+# rsync skips the transfer when your copy is already up to date, and
+# replaces it when the remote file changed.
+#
+# Inputs from iTerm2:
+#   $1    = 1 if Option was held while clicking (open in background), else 0
+#   $2    = pid of the program running in the clicked tab (e.g. "ssh vultr")
+#   stdin = the clicked URL (kept off the shell command line, so a crafted link
+#           cannot inject shell commands)
+#
+# Only single files are fetched; folder links are refused (no accidental GBs).
+# Log: ~/Library/Logs/iterm2-open-file-link.log
+# Turn off: defaults delete com.googlecode.iterm2 UrlHandlerCommand
+
+set -u
+BASE="$HOME/Downloads/iterm2-opened-files"
+LOG="$HOME/Library/Logs/iterm2-open-file-link.log"
+
+background="${1:-0}"
+jobpid="${2:-}"
+case "$jobpid" in *[!0-9]*) jobpid="" ;; esac
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+notify() {  # notify TITLE TEXT
+    /usr/bin/osascript -e 'on run argv' \
+        -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+        -e 'end run' "$1" "$2" >/dev/null 2>&1
+}
+
+fail() {  # show the reason; if our notification can't show, exit 1 so iTerm2 reports it
+    log "FAILED: $1"
+    echo "$1" >&2
+    notify "Download failed" "$1" || exit 1
+    exit 0
+}
+
+open_normally() {
+    if [ "$background" = 1 ] || [ "$background" = true ]; then
+        /usr/bin/open -g "$1"
+    else
+        /usr/bin/open "$1"
+    fi
+}
+
+remote_quote() {  # quote a path for the remote shell: '…', with ' written as '\''
+    local sq="'"
+    printf "'%s'" "${1//$sq/$sq\\$sq$sq}"
+}
+
+url=""
+IFS= read -r url || true
+[ -n "$url" ] || exit 0
+
+# 1. Not a file link → open it the normal way.
+case "$url" in
+    file://*) ;;
+    *) open_normally "$url"; exit $? ;;
+esac
+
+# 2. file:///path or file://localhost/path → /path
+path="${url#file://}"
+path="${path#localhost}"
+case "$path" in
+    /*) ;;
+    *) open_normally "$url"; exit $? ;;   # file://otherhost/… → leave it to macOS
+esac
+path="${path%%\#*}"                        # drop #fragment
+path="${path%%\?*}"                        # drop ?query
+path=$(printf '%b' "${path//\%/\\x}")      # decode %20 etc.
+
+# 3. The file is on this Mac → open it the normal way.
+if [ -e "$path" ]; then
+    open_normally "$path"
+    exit $?
+fi
+
+# 4. Remote file → fetch it.
+case "$path" in
+    */../*|*/./*|*/..|*/.) fail "Refusing unusual path: $path" ;;
+esac
+name="${path##*/}"
+[ -n "$name" ] || fail "That link is a folder; only single files are fetched."
+destdir="$BASE"
+
+tabcmd=""
+[ -n "$jobpid" ] && tabcmd=$(/bin/ps -o command= -p "$jobpid" 2>/dev/null)
+case "$path" in
+    /home/linuxuser/*) host="vultr"; where="the VPS" ;;
+    *)
+        case "$tabcmd" in
+            *seis*) host="u6xd-seis" ;;
+            *)      host="u6xd-vultr" ;;
+        esac
+        where="Isambard" ;;
+esac
+
+log "fetch $host:$path  (clicked tab runs: ${tabcmd:-unknown})"
+mkdir -p "$destdir" || fail "Cannot create $destdir"
+
+# -t keeps the remote modification time, so the next click can skip an unchanged file.
+# No -r: a folder is skipped instead of copied.
+err=$(/usr/bin/rsync -t -e "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=20" \
+      "$host:$(remote_quote "$path")" "$destdir/" 2>&1)
+rc=$?
+err=$(printf '%s\n' "$err" | grep -vE 'post-quantum|store now|upgraded|openssh.com/pq')
+
+if [ "$rc" -eq 0 ] && [ -f "$destdir/$name" ]; then
+    log "ok → $destdir/$name"
+    /usr/bin/open -R "$destdir/$name"
+    exit 0
+fi
+
+case "$err" in
+    *"No such file"*)
+        fail "$name was not found on $where." ;;
+    *"skipping directory"*|*"is a directory"*)
+        fail "$name is a folder; only single files are fetched." ;;
+    *"Permission denied"*)
+        fail "Login to $where failed. Isambard certificate expired? Run clifton on this Mac." ;;
+    *)
+        fail "$name: $(printf '%s\n' "$err" | tail -n 1) (via $host)" ;;
+esac
