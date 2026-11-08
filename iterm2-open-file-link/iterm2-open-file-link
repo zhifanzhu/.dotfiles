@@ -115,7 +115,10 @@ mkdir -p "$destdir" || fail "Cannot create $destdir"
 
 # -t keeps the remote modification time, so the next click can skip an unchanged file.
 # No -r: a folder is skipped instead of copied.
-err=$(/usr/bin/rsync -t -e "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=20" \
+# Control*: keep the login open for 10 min so later clicks are fast. The socket
+# (ssh-dl-<host> in your private temp folder, $TMPDIR) is used only by this
+# script, so it never shares a connection with VS Code or your terminal logins.
+err=$(/usr/bin/rsync -t -e "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=auto -o ControlPath=${TMPDIR:-/tmp/}ssh-dl-%n -o ControlPersist=10m" \
       "$host:$(remote_quote "$path")" "$destdir/" 2>&1)
 rc=$?
 err=$(printf '%s\n' "$err" | grep -vE 'post-quantum|store now|upgraded|openssh.com/pq')
