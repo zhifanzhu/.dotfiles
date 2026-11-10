@@ -10,8 +10,16 @@
 #   file:// that exists on this Mac  → opens it normally, as before
 #   file:// NOT on this Mac           → fetches it, then shows it in Finder:
 #       /home/linuxuser/…   → from the VPS (vultr)
+#       clicked tab runs "ssh cibo.dl" → from cibo.dl
 #       anything else       → from Isambard, using the clicked tab's route:
 #                             tab runs "ssh seis…" → u6xd-seis, otherwise → u6xd-vultr
+#   http:// link that is really a path → looks the file up, then fetches it:
+#       iTerm2 turns plain text like  outputs/val/x.zip  into  http://outputs/val/x.zip.
+#       Only for names ending in .zip .png .mp4 (EXTS), and only when the "website"
+#       part can't be a real one (no dot, or contains "_"). Real links such as
+#       https://github.com/…/main.zip and http://localhost:6006 still open in the browser.
+#       The path is looked for in ISAMBARD_ROOT and VPS_ROOT, directly and one
+#       project folder down. Exactly one match → fetched; otherwise a notification.
 #
 # Where files go:  ~/Downloads/iterm2-opened-files/<file>   (flat; same name = replaced)
 # rsync skips the transfer when your copy is already up to date, and
@@ -30,6 +38,15 @@
 set -u
 BASE="$HOME/Downloads/iterm2-opened-files"
 LOG="$HOME/Library/Logs/iterm2-open-file-link.log"
+EXTS="zip png mp4"                                   # http "links" ending in these may be paths
+ISAMBARD_ROOT="/lus/lfs1aip2/projects/u6xd/zhifan"   # where such paths are looked for
+VPS_ROOT="/home/linuxuser"
+
+# ssh for looking up and fetching. Control*: keep the login open for 10 min so later
+# clicks are fast. The socket (ssh-dl-<host> in your private temp folder, $TMPDIR) is
+# used only by this script, so it never shares a connection with VS Code or your
+# terminal logins.
+SSH="/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=auto -o ControlPath=${TMPDIR:-/tmp/}ssh-dl-%n -o ControlPersist=10m"
 
 background="${1:-0}"
 jobpid="${2:-}"
@@ -63,69 +80,149 @@ remote_quote() {  # quote a path for the remote shell: '…', with ' written as 
     printf "'%s'" "${1//$sq/$sq\\$sq$sq}"
 }
 
+decode() { printf '%b' "${1//\%/\\x}"; }   # %20 → space etc.
+
+isambard_host() {  # the clicked tab's route: "ssh seis…" → u6xd-seis, otherwise u6xd-vultr
+    case "$tabcmd" in *seis*) echo u6xd-seis ;; *) echo u6xd-vultr ;; esac
+}
+
+# iTerm2 turns plain text such as  outputs/val/x.zip  into the link  http://outputs/val/x.zip.
+# disguised_path URL → prints outputs/val/x.zip if URL is such a path; returns 1 if it is
+# a real link.
+disguised_path() {
+    local rest host lower ext match=""
+    case "$1" in
+        http://*|https://*) rest="${1#*://}" ;;
+        *:*) return 1 ;;                          # mailto:, ssh:, … → a real link
+        *)   rest="$1" ;;                         # no scheme at all
+    esac
+    rest="${rest%%[?#]*}"                         # drop ?query / #fragment
+    rest="${rest#./}"                             # ./outputs/x.zip → outputs/x.zip
+    lower=$(printf '%s' "$rest" | tr '[:upper:]' '[:lower:]')
+    for ext in $EXTS; do
+        case "$lower" in *."$ext") match=1 ;; esac
+    done
+    [ -n "$match" ] || return 1                   # not .zip/.png/.mp4 → a real link
+    host="${rest%%/*}"
+    case "$host" in
+        ""|localhost|*:*) return 1 ;;             # local web server, or has a port
+        *_*) ;;                                   # "_" is never in a web address → a path
+        *.*) [ "$host" = "$rest" ] || return 1 ;; # github.com/… → real; bare x.zip → a path
+    esac
+    printf '%s\n' "$rest"
+}
+
+# search_host SSH_HOST ROOT REL → prints "FOUND:<path>" for each file ROOT/REL or ROOT/*/REL.
+# ssh exits 255 if the login fails.
+search_host() {
+    local r q
+    r=$(remote_quote "$2"); q=$(remote_quote "$3")
+    $SSH "$1" "for f in $r/$q $r/*/$q; do [ -f \"\$f\" ] && printf 'FOUND:%s\\n' \"\$f\"; done; true" 2>/dev/null
+}
+
+# find_remote REL → sets host + path if REL exists exactly once on Isambard and the VPS
+# together (both are searched at the same time); otherwise shows why and stops.
+find_remote() {
+    local rel="$1" isa tmp hits n down=""
+    isa=$(isambard_host)
+    tmp=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp/}iterm2-link.XXXXXX") || fail "Cannot create a temp folder"
+    log "look up $rel on $isa:$ISAMBARD_ROOT and vultr:$VPS_ROOT"
+    { search_host "$isa" "$ISAMBARD_ROOT" "$rel" >"$tmp/isa"; echo $? >"$tmp/isa.rc"; } &
+    { search_host vultr "$VPS_ROOT" "$rel" >"$tmp/vps"; echo $? >"$tmp/vps.rc"; } &
+    wait
+    hits=$(sed -n "s|^FOUND:|$isa |p" "$tmp/isa"; sed -n 's|^FOUND:|vultr |p' "$tmp/vps")
+    [ "$(cat "$tmp/isa.rc")" = 0 ] || down="Isambard"
+    [ "$(cat "$tmp/vps.rc")" = 0 ] || down="${down:+$down and }the VPS"
+    rm -rf "$tmp"
+    n=0
+    [ -n "$hits" ] && n=$(printf '%s\n' "$hits" | wc -l | tr -d ' ')
+    if [ "$n" = 1 ]; then
+        host="${hits%% *}"
+        path="${hits#* }"
+        return 0
+    fi
+    if [ "$n" != 0 ]; then
+        log "matches: $(printf '%s' "$hits" | tr '\n' ';')"
+        fail "${rel##*/}: found $n copies. Ask for a file:/// link."
+    fi
+    [ -z "$down" ] || fail "Login to $down failed. Isambard certificate expired? Run clifton on this Mac."
+    fail "${rel##*/} was not found on Isambard or the VPS. Ask for a file:/// link."
+}
+
 url=""
 IFS= read -r url || true
 [ -n "$url" ] || exit 0
 
-# 1. Not a file link → open it the normal way.
-case "$url" in
-    file://*) ;;
-    *) open_normally "$url"; exit $? ;;
-esac
-
-# 2. file:///path or file://localhost/path → /path
-path="${url#file://}"
-path="${path#localhost}"
-case "$path" in
-    /*) ;;
-    *) open_normally "$url"; exit $? ;;   # file://otherhost/… → leave it to macOS
-esac
-path="${path%%\#*}"                        # drop #fragment
-path="${path%%\?*}"                        # drop ?query
-path=$(printf '%b' "${path//\%/\\x}")      # decode %20 etc.
-
-# 3. The file is on this Mac → open it the normal way.
-if [ -e "$path" ]; then
-    open_normally "$path"
-    exit $?
-fi
-
-# 4. Remote file → fetch it.
-case "$path" in
-    */../*|*/./*|*/..|*/.) fail "Refusing unusual path: $path" ;;
-esac
-name="${path##*/}"
-[ -n "$name" ] || fail "That link is a folder; only single files are fetched."
-destdir="$BASE"
-
 tabcmd=""
 [ -n "$jobpid" ] && tabcmd=$(/bin/ps -o command= -p "$jobpid" 2>/dev/null)
-case "$path" in
-    /home/linuxuser/*) host="vultr"; where="the VPS" ;;
-    *)
-        case "$tabcmd" in
-            *seis*) host="u6xd-seis" ;;
-            *)      host="u6xd-vultr" ;;
+
+case "$url" in /*) url="file://$url" ;; esac   # a bare /path is treated like file:///path
+
+case "$url" in
+    file://*)
+        # 1. file:///path or file://localhost/path → /path
+        path="${url#file://}"
+        path="${path#localhost}"
+        case "$path" in
+            /*) ;;
+            *) open_normally "$url"; exit $? ;;   # file://otherhost/… → leave it to macOS
         esac
-        where="Isambard" ;;
+        path="${path%%\#*}"                        # drop #fragment
+        path="${path%%\?*}"                        # drop ?query
+        path=$(decode "$path")
+
+        # 2. The file is on this Mac → open it the normal way.
+        if [ -e "$path" ]; then
+            open_normally "$path"
+            exit $?
+        fi
+        case "$path" in
+            */../*|*/./*|*/..|*/.) fail "Refusing unusual path: $path" ;;
+        esac
+        case "$path" in
+            /home/linuxuser/*) host="vultr" ;;
+            *) case "$tabcmd" in
+                   *cibo*) host="cibo.dl" ;;        # tab runs "ssh cibo.dl" → from cibo
+                   *)      host=$(isambard_host) ;;
+               esac ;;
+        esac
+        ;;
+    *)
+        # 3. Any other link → open it the normal way, unless it is really a path (see top).
+        rel=$(disguised_path "$url") || { open_normally "$url"; exit $?; }
+        rel=$(decode "$rel")
+        case "/$rel/" in
+            */../*|*/./*) fail "Refusing unusual path: $rel" ;;
+        esac
+        case "$rel" in
+            */*) ;;
+            *) fail "$rel is only a file name. Ask for the full path or a file:/// link." ;;
+        esac
+        find_remote "$rel"
+        ;;
+esac
+
+# 4. Fetch host:path into BASE, then show it in Finder.
+name="${path##*/}"
+[ -n "$name" ] || fail "That link is a folder; only single files are fetched."
+case "$host" in
+    vultr)   where="the VPS" ;;
+    cibo.dl) where="cibo.dl" ;;
+    *)       where="Isambard" ;;
 esac
 
 log "fetch $host:$path  (clicked tab runs: ${tabcmd:-unknown})"
-mkdir -p "$destdir" || fail "Cannot create $destdir"
+mkdir -p "$BASE" || fail "Cannot create $BASE"
 
 # -t keeps the remote modification time, so the next click can skip an unchanged file.
 # No -r: a folder is skipped instead of copied.
-# Control*: keep the login open for 10 min so later clicks are fast. The socket
-# (ssh-dl-<host> in your private temp folder, $TMPDIR) is used only by this
-# script, so it never shares a connection with VS Code or your terminal logins.
-err=$(/usr/bin/rsync -t -e "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=auto -o ControlPath=${TMPDIR:-/tmp/}ssh-dl-%n -o ControlPersist=10m" \
-      "$host:$(remote_quote "$path")" "$destdir/" 2>&1)
+err=$(/usr/bin/rsync -t -e "$SSH" "$host:$(remote_quote "$path")" "$BASE/" 2>&1)
 rc=$?
 err=$(printf '%s\n' "$err" | grep -vE 'post-quantum|store now|upgraded|openssh.com/pq')
 
-if [ "$rc" -eq 0 ] && [ -f "$destdir/$name" ]; then
-    log "ok → $destdir/$name"
-    /usr/bin/open -R "$destdir/$name"
+if [ "$rc" -eq 0 ] && [ -f "$BASE/$name" ]; then
+    log "ok → $BASE/$name"
+    /usr/bin/open -R "$BASE/$name"
     exit 0
 fi
 
